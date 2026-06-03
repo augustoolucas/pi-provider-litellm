@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildCompat, discoverModels, normalizeBaseUrl, shouldSuppressReasoningContent } from "../src/discover.js";
+import {
+  buildCompat,
+  discoverModels,
+  hasExplicitV1Suffix,
+  normalizeBaseUrl,
+  resolveApiBaseUrl,
+  shouldSuppressReasoningContent,
+} from "../src/discover.js";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -269,5 +276,76 @@ describe("discoverModels timeout", () => {
     const start = Date.now();
     await expect(discoverModels("https://litellm.example.com", "sk-test", { timeoutMs: 30 })).rejects.toBeDefined();
     expect(Date.now() - start).toBeLessThan(500);
+  });
+});
+
+describe("hasExplicitV1Suffix", () => {
+  it("detects explicit trailing /v1", () => {
+    expect(hasExplicitV1Suffix("https://host.example.com/v1")).toBe(true);
+    expect(hasExplicitV1Suffix("https://host.example.com/v1/")).toBe(true);
+    expect(hasExplicitV1Suffix("https://host.example.com/proxy/v1")).toBe(true);
+  });
+
+  it("rejects when /v1 is not at the end", () => {
+    expect(hasExplicitV1Suffix("https://host.example.com")).toBe(false);
+    expect(hasExplicitV1Suffix("https://host.example.com/proxy")).toBe(false);
+    expect(hasExplicitV1Suffix("https://host.example.com/v1/something")).toBe(false);
+  });
+});
+
+describe("resolveApiBaseUrl", () => {
+  it("preserves explicit /v1 suffix without probing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const result = await resolveApiBaseUrl(
+      "https://host.example.com/proxy",
+      "https://host.example.com/proxy/v1",
+      "sk-test",
+    );
+    expect(result).toBe("https://host.example.com/proxy/v1");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("appends /v1 without probing for root URLs (no path)", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const result = await resolveApiBaseUrl("https://host.example.com", "https://host.example.com", "sk-test");
+    expect(result).toBe("https://host.example.com/v1");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("probes /v1/models and uses /v1 when it exists", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse(200, { data: [{ id: "test-model" }] }));
+    const result = await resolveApiBaseUrl(
+      "https://host.example.com/proxy",
+      "https://host.example.com/proxy",
+      "sk-test",
+    );
+    expect(result).toBe("https://host.example.com/proxy/v1");
+  });
+
+  it("uses base URL directly when /v1/models returns 404", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(null, { status: 404 }));
+    const result = await resolveApiBaseUrl(
+      "https://host.example.com/proxy",
+      "https://host.example.com/proxy",
+      "sk-test",
+    );
+    expect(result).toBe("https://host.example.com/proxy");
+  });
+
+  it("falls back to /v1 when probe returns non-404 error", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(null, { status: 401 }));
+    const result = await resolveApiBaseUrl(
+      "https://host.example.com/proxy",
+      "https://host.example.com/proxy",
+      "sk-test",
+    );
+    expect(result).toBe("https://host.example.com/proxy/v1");
+  });
+
+  it("defaults to /v1 when apiKey is missing (cannot probe)", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const result = await resolveApiBaseUrl("https://host.example.com/proxy", "https://host.example.com/proxy", "");
+    expect(result).toBe("https://host.example.com/proxy/v1");
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
