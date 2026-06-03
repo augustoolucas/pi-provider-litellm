@@ -5,9 +5,16 @@ import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-codin
 import { AuthStorage, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { fingerprint, readCache, writeCache } from "./cache.js";
 import { setupLiteLLMCostTracking } from "./cost.js";
-import { discoverModels, normalizeBaseUrl, shouldSuppressReasoningContent } from "./discover.js";
+import { discoverModels, normalizeBaseUrl, resolveApiBaseUrl, shouldSuppressReasoningContent } from "./discover.js";
 import { getSessionIdFromFile } from "./litellm.js";
-import type { AuthFileEntry, CacheFile, DiscoveryOptions, DiscoveryResult, ResolvedCredentials } from "./types.js";
+import type {
+  AuthFileEntry,
+  CacheFile,
+  DiscoveryOptions,
+  DiscoveryResult,
+  LiteLLMOAuthCredentials,
+  ResolvedCredentials,
+} from "./types.js";
 
 const PROVIDER_NAME = "litellm";
 const ENV_BASE_URL = "LITELLM_BASE_URL";
@@ -53,6 +60,7 @@ async function resolveCredentials(): Promise<ResolvedCredentials> {
   const rawBase = authBase || envBase;
   return {
     baseUrl: rawBase ? normalizeBaseUrl(rawBase) : undefined,
+    rawBaseUrl: rawBase,
     apiKey: authKey || envKey || undefined,
   };
 }
@@ -95,7 +103,7 @@ async function loginLiteLLM(
 ): Promise<OAuthCredentials> {
   const rawBaseUrl = (
     await callbacks.onPrompt({
-      message: "Enter LiteLLM proxy URL (no trailing /v1):",
+      message: "Enter LiteLLM proxy URL (include /v1 only if your gateway requires it):",
       placeholder: "https://litellm.example.com",
     })
   ).trim();
@@ -108,8 +116,14 @@ async function loginLiteLLM(
     signal: callbacks.signal,
   });
 
+  const apiBaseUrl = await resolveApiBaseUrl(baseUrl, rawBaseUrl, apiKey, {
+    timeoutMs: LOGIN_TIMEOUT_MS,
+    signal: callbacks.signal,
+  });
+
   const cache: CacheFile = {
     baseUrl,
+    apiBaseUrl,
     apiKeyFingerprint: fingerprint(apiKey),
     fetchedAt: Date.now(),
     source,
@@ -124,7 +138,8 @@ async function loginLiteLLM(
     refresh: "",
     expires: Number.MAX_SAFE_INTEGER,
     baseUrl,
-  } as OAuthCredentials & { baseUrl: string };
+    apiBaseUrl,
+  } as OAuthCredentials & LiteLLMOAuthCredentials;
 }
 
 async function refreshLiteLLM(credentials: OAuthCredentials): Promise<OAuthCredentials> {
@@ -132,9 +147,10 @@ async function refreshLiteLLM(credentials: OAuthCredentials): Promise<OAuthCrede
 }
 
 function modifyLiteLLMModels(models: Model<Api>[], cred: OAuthCredentials): Model<Api>[] {
-  const baseUrl = (cred as { baseUrl?: string }).baseUrl;
+  const credRecord = cred as Record<string, unknown>;
+  const baseUrl = (credRecord.apiBaseUrl as string | undefined) || (credRecord.baseUrl as string | undefined);
   if (!baseUrl) return models;
-  return models.map((m) => (m.provider === PROVIDER_NAME ? { ...m, baseUrl: `${baseUrl}/v1` } : m));
+  return models.map((m) => (m.provider === PROVIDER_NAME ? { ...m, baseUrl } : m));
 }
 
 function prepareLiteLLMRequestPayload(
@@ -240,6 +256,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     cache.apiKeyFingerprint === fp;
 
   let models: ProviderModelConfig[] = cacheValid && cache ? cache.models : [];
+  let apiBaseUrl: string | undefined = cacheValid && cache ? cache.apiBaseUrl : undefined;
   const haveCreds = creds.baseUrl !== undefined && creds.apiKey !== undefined && fp !== undefined;
   const shouldFetch = haveCreds && !isOffline() && (!cacheValid || isListModelsMode());
 
@@ -259,8 +276,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
         }
       } else {
         models = result.models;
+        apiBaseUrl = await resolveApiBaseUrl(creds.baseUrl!, creds.rawBaseUrl ?? creds.baseUrl!, creds.apiKey!, {
+          timeoutMs,
+        });
         const next: CacheFile = {
-          baseUrl: creds.baseUrl,
+          baseUrl: creds.baseUrl!,
+          apiBaseUrl,
           apiKeyFingerprint: fp,
           fetchedAt: Date.now(),
           source: result.source,
@@ -275,6 +296,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
   }
 
+  // Resolve apiBaseUrl for existing installs where the cache predates this field.
+  if (!apiBaseUrl && creds.baseUrl && creds.apiKey) {
+    apiBaseUrl = await resolveApiBaseUrl(creds.baseUrl, creds.rawBaseUrl ?? creds.baseUrl, creds.apiKey);
+  }
+
   const oauth = {
     name: "LiteLLM",
     login: (callbacks: OAuthLoginCallbacks) =>
@@ -286,9 +312,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     modifyModels: modifyLiteLLMModels,
   };
 
-  function registerProvider(baseUrl: string | undefined, models: ProviderModelConfig[]): void {
+  function registerProvider(apiBaseUrl: string | undefined, models: ProviderModelConfig[]): void {
     pi.registerProvider(PROVIDER_NAME, {
-      baseUrl: baseUrl ? `${baseUrl}/v1` : "https://litellm.example.com/v1",
+      baseUrl: apiBaseUrl || "https://litellm.example.com/v1",
       apiKey: ENV_API_KEY,
       api: "openai-completions",
       models,
@@ -296,7 +322,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     });
   }
 
-  registerProvider(creds.baseUrl, models);
+  registerProvider(apiBaseUrl, models);
 
   const updateCosts = setupLiteLLMCostTracking(pi, models);
 
@@ -315,15 +341,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       throw new Error("no credentials. Run /login litellm or set env vars.");
     }
     const result = await discoverModels(fresh.baseUrl, fresh.apiKey, { timeoutMs: getDiscoveryTimeoutMs() });
+    const apiBaseUrl = await resolveApiBaseUrl(fresh.baseUrl, fresh.rawBaseUrl ?? fresh.baseUrl, fresh.apiKey);
     const now = Date.now();
     await writeCache(getCachePath(), {
       baseUrl: fresh.baseUrl,
+      apiBaseUrl,
       apiKeyFingerprint: freshFp,
       fetchedAt: now,
       source: result.source,
       models: result.models,
     });
-    registerProvider(fresh.baseUrl, result.models);
+    registerProvider(apiBaseUrl, result.models);
     updateCosts(result.models);
     cacheFetchedAt = now;
     return { models: result.models, source: result.source };

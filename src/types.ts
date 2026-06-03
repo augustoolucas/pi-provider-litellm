@@ -4,6 +4,7 @@ export type DiscoverySource = "model_info" | "models_list";
 
 export interface CacheFile {
   baseUrl: string;
+  apiBaseUrl?: string;
   apiKeyFingerprint: string;
   fetchedAt: number;
   source: DiscoverySource;
@@ -48,11 +49,18 @@ export interface ModelsListResponse {
   data?: ModelsListEntry[];
 }
 
-export type AuthFileEntry =
-  | { type: "oauth"; access: string; refresh: string; expires: number; baseUrl?: string }
-  | { type: "api_key"; key: string };
+export interface LiteLLMOAuthCredentials {
+  access: string;
+  refresh: string;
+  expires: number;
+  baseUrl?: string;
+  apiBaseUrl?: string;
+}
+
+export type AuthFileEntry = ({ type: "oauth" } & LiteLLMOAuthCredentials) | { type: "api_key"; key: string };
 
 export interface ResolvedCredentials {
   baseUrl?: string;
+  rawBaseUrl?: string;
   apiKey?: string;
 }

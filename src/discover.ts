@@ -42,6 +42,71 @@ export function normalizeBaseUrl(input: string): string {
   return input.replace(/\/+$/, "").replace(/\/v1\/?$/i, "");
 }
 
+/**
+ * Detect whether the user explicitly typed a trailing /v1 by comparing
+ * the raw input with the normalized form.
+ */
+export function hasExplicitV1Suffix(rawInput: string): boolean {
+  const trimmed = rawInput.replace(/\/+$/, "");
+  return /\/v1$/i.test(trimmed);
+}
+
+/**
+ * Resolve the OpenAI-compatible API base URL.
+ *
+ * - If the user explicitly supplied /v1, preserve it.
+ * - If the URL is a root URL (no path), append /v1.
+ * - If the URL has a subpath and the user did not supply /v1, probe
+ *   `{base}/v1/models` to decide whether the API lives under /v1 or at
+ *   the root.
+ */
+export async function resolveApiBaseUrl(
+  normalizedBase: string,
+  rawInput: string,
+  apiKey: string,
+  options: DiscoveryOptions = {},
+): Promise<string> {
+  // Explicit /v1 from the user — preserve it.
+  if (hasExplicitV1Suffix(rawInput)) {
+    const trimmed = rawInput.replace(/\/+$/, "");
+    return trimmed;
+  }
+
+  // Root URL (no subpath) — always needs /v1.
+  try {
+    const url = new URL(normalizedBase);
+    if (url.pathname === "/" || url.pathname === "") {
+      return `${normalizedBase}/v1`;
+    }
+  } catch {
+    return `${normalizedBase}/v1`;
+  }
+
+  // Subpath — probe whether /v1/models exists.
+  // Use the same base that discovery uses.
+  if (!apiKey) {
+    // Without an API key we cannot probe; default to /v1 (safe).
+    return `${normalizedBase}/v1`;
+  }
+
+  try {
+    const probeResult = await fetchJson<unknown>(`${normalizedBase}/v1/models`, apiKey, options);
+    if (probeResult.ok) {
+      return `${normalizedBase}/v1`;
+    }
+    // Non-404 errors (401, 403, 500, etc.) are treated conservatively: assume
+    // /v1 exists but the probe failed for another reason. Only 404 means the
+    // route truly doesn't exist, so we fall through to the direct URL.
+    if (probeResult.status !== 404) {
+      return `${normalizedBase}/v1`;
+    }
+    return normalizedBase;
+  } catch {
+    // Network error (timeout, connection refused) — cannot probe; default to /v1.
+    return `${normalizedBase}/v1`;
+  }
+}
+
 // Matches both the conventional `anthropic/...` prefix and aliases that
 // LiteLLM deployments commonly assign to Anthropic-backed routes (e.g.
 // `google/claude-sonnet-4-6`, `opus-4.7`, `sonnet-4.6`, `haiku-4.5`). Without
